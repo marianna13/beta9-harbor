@@ -1,0 +1,88 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: blobcache
+  namespace: beta9
+  labels:
+    app: blobcache
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: blobcache
+  template:
+    metadata:
+      labels:
+        app: blobcache
+    spec:
+      containers:
+      - name: blobcache
+        image: public.ecr.aws/n4e0e1y0/beam-blobcache-v2:0.1.30
+        ports:
+        - containerPort: 2049
+          protocol: TCP
+        env:
+        - name: CONFIG_JSON
+          value: |
+            {
+              "server": {
+                "mode": "coordinator",
+                "disk_cache_dir": "/blobcache-data",
+                "disk_cache_max_usage_pct": 0.95,
+                "max_cache_pct": 60,
+                "page_size_bytes": 4000000,
+                "metadata": {
+                  "redis_addr": "redis-master:6379"
+                }
+              },
+              "global": {
+                "default_locality": "default",
+                "server_port": 2049,
+                "discovery_interval_s": 5,
+                "grpc_message_size_bytes": 1073741824
+              }
+            }
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+          limits:
+            cpu: 4000m
+            memory: 8Gi
+        volumeMounts:
+        - name: blobcache-data
+          mountPath: /blobcache-data
+        livenessProbe:
+          tcpSocket:
+            port: 2049
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        readinessProbe:
+          tcpSocket:
+            port: 2049
+          initialDelaySeconds: 5
+          periodSeconds: 10
+      volumes:
+      - name: blobcache-data
+        hostPath:
+          path: /mnt/data/blobcache
+          type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: blobcache
+  namespace: beta9
+  labels:
+    app: blobcache
+spec:
+  type: ClusterIP
+  ports:
+  - port: 2049
+    targetPort: 2049
+    protocol: TCP
+    name: grpc
+  selector:
+    app: blobcache

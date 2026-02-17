@@ -5,6 +5,7 @@
 !go.mod
 !go.sum
 !sdk
+!clip-lib
 !bin/volume_cache_*
 !bin/ipbind_*
 !bin/beta9-cli

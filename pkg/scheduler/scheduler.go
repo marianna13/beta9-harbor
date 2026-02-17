@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/rand"
 	"slices"
 	"sort"
 	"strings"
@@ -36,6 +37,7 @@ type Scheduler struct {
 	eventRepo             repo.EventRepository
 	schedulerUsageMetrics SchedulerUsageMetrics
 	eventBus              *common.EventBus
+	requestSignal         chan struct{}
 }
 
 func NewScheduler(ctx context.Context, config types.AppConfig, redisClient *common.RedisClient, usageRepo repo.UsageMetricsRepository, backendRepo repo.BackendRepository, workspaceRepo repo.WorkspaceRepository, tailscale *network.Tailscale) (*Scheduler, error) {
@@ -108,6 +110,7 @@ func NewScheduler(ctx context.Context, config types.AppConfig, redisClient *comm
 		schedulerUsageMetrics: schedulerUsage,
 		eventRepo:             eventRepo,
 		workspaceRepo:         workspaceRepo,
+		requestSignal:         make(chan struct{}, 1),
 	}, nil
 }
 
@@ -247,23 +250,41 @@ func (s *Scheduler) getControllers(request *types.ContainerRequest) ([]WorkerPoo
 
 func (s *Scheduler) StartProcessingRequests() {
 	for {
-		select {
-		case <-s.ctx.Done():
-			// Context has been cancelled
-			return
-		default:
-			// Continue processing requests
+		// Wait for work if backlog is empty
+		if s.requestBacklog.Len() == 0 {
+			select {
+			case <-s.requestSignal:
+				// New request arrived
+			case <-s.ctx.Done():
+				return
+			case <-time.After(requestProcessingInterval):
+				// Periodic fallback check
+			}
+			continue
 		}
 
-		if s.requestBacklog.Len() == 0 {
-			time.Sleep(requestProcessingInterval)
-			continue
+		select {
+		case <-s.ctx.Done():
+			return
+		default:
+		}
+
+		s.processBacklog()
+	}
+}
+
+// processBacklog drains all available requests from the backlog in a tight loop
+func (s *Scheduler) processBacklog() {
+	for s.requestBacklog.Len() > 0 {
+		select {
+		case <-s.ctx.Done():
+			return
+		default:
 		}
 
 		request, err := s.requestBacklog.Pop()
 		if err != nil {
-			time.Sleep(requestProcessingInterval)
-			continue
+			return
 		}
 
 		// Find a worker to schedule ContainerRequests on
@@ -594,17 +615,26 @@ func (s *Scheduler) selectWorker(request *types.ContainerRequest) (*types.Worker
 		scoredWorkers = append(scoredWorkers, scoredWorker{worker: worker, score: score})
 	}
 
-	// Select the worker with the highest score
-	sort.Slice(scoredWorkers, func(i, j int) bool {
-		// TODO: Figure out a short way to randomize order of workers with the same score
+	// Select the worker with the highest score, randomizing among equal-score workers
+	rand.Shuffle(len(scoredWorkers), func(i, j int) {
+		scoredWorkers[i], scoredWorkers[j] = scoredWorkers[j], scoredWorkers[i]
+	})
+	sort.SliceStable(scoredWorkers, func(i, j int) bool {
 		return scoredWorkers[i].score > scoredWorkers[j].score
 	})
 
 	return scoredWorkers[0].worker, nil
 }
 
-const maxScheduleRetryCount = 3
+const maxScheduleRetryCount = 5
 const maxScheduleRetryDuration = 10 * time.Minute
+
+func (s *Scheduler) signalNewRequest() {
+	select {
+	case s.requestSignal <- struct{}{}:
+	default:
+	}
+}
 
 func (s *Scheduler) addRequestToBacklog(request *types.ContainerRequest) error {
 	if request.RequiresGPU() && request.GpuCount <= 0 {
@@ -613,7 +643,11 @@ func (s *Scheduler) addRequestToBacklog(request *types.ContainerRequest) error {
 
 	if request.RetryCount == 0 {
 		request.RetryCount++
-		return s.requestBacklog.Push(request)
+		err := s.requestBacklog.Push(request)
+		if err == nil {
+			s.signalNewRequest()
+		}
+		return err
 	}
 
 	go func() {
@@ -621,7 +655,9 @@ func (s *Scheduler) addRequestToBacklog(request *types.ContainerRequest) error {
 			delay := calculateBackoffDelay(request.RetryCount)
 			time.Sleep(delay)
 			request.RetryCount++
-			s.requestBacklog.Push(request)
+			if s.requestBacklog.Push(request) == nil {
+				s.signalNewRequest()
+			}
 			return
 		}
 

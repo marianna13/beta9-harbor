@@ -49,6 +49,8 @@ from ..clients.pod import (
     PodSandboxUpdateTtlRequest,
     PodSandboxUpdateTtlResponse,
     PodSandboxUploadFileRequest,
+    PodSandboxWaitForCompletionRequest,
+    PodSandboxWaitForCompletionResponse,
     PodServiceStub,
 )
 from ..env import is_remote
@@ -1170,9 +1172,11 @@ class SandboxProcess:
         """
         self.exit_code, self._status = self.status()
 
+        poll_interval = 0.01  # start at 10ms
         while self.exit_code < 0:
             self.exit_code, self._status = self.status()
-            time.sleep(0.1)
+            time.sleep(poll_interval)
+            poll_interval = min(poll_interval * 1.5, 0.1)  # ramp up to 100ms
 
         return self.exit_code
 
@@ -1243,6 +1247,41 @@ class SandboxProcess:
             raise SandboxProcessError(response.error_msg)
 
         return response.exit_code, response.status
+
+    def wait_for_completion(self, timeout: int = 300) -> Tuple[int, str, str]:
+        """
+        Wait for the process to complete and return exit code, stdout, and stderr
+        in a single server-side blocking RPC call.
+
+        Parameters:
+            timeout (int): Maximum seconds to wait. Default is 300.
+
+        Returns:
+            Tuple[int, str, str]: (exit_code, stdout, stderr)
+
+        Raises:
+            SandboxProcessError: If the call fails or times out.
+        """
+
+        def _do_wait():
+            return self.sandbox_instance.stub.sandbox_wait_for_completion(
+                PodSandboxWaitForCompletionRequest(
+                    container_id=self.sandbox_instance.container_id,
+                    pid=self.pid,
+                    timeout_seconds=timeout,
+                )
+            )
+
+        response = retry_on_transient_error(_do_wait)
+
+        if not response.ok:
+            raise SandboxProcessError(response.error_msg)
+
+        if response.timed_out:
+            raise SandboxProcessError(f"Process timed out after {timeout}s")
+
+        self.exit_code = response.exit_code
+        return response.exit_code, response.stdout, response.stderr
 
     @property
     def stdout(self):
@@ -3132,6 +3171,21 @@ class AsyncSandboxProcess:
             Tuple[int, str]: A tuple containing (exit_code, status_string).
         """
         return await asyncio.to_thread(self._sync.status)
+
+    async def wait_for_completion(self, timeout: int = 300) -> Tuple[int, str, str]:
+        """
+        Wait for process completion asynchronously via a single server-side blocking RPC.
+
+        Parameters:
+            timeout (int): Maximum seconds to wait. Default is 300.
+
+        Returns:
+            Tuple[int, str, str]: (exit_code, stdout, stderr)
+
+        Raises:
+            SandboxProcessError: If the call fails or times out.
+        """
+        return await asyncio.to_thread(self._sync.wait_for_completion, timeout)
 
     @property
     def stdout(self) -> "AsyncSandboxProcessStream":

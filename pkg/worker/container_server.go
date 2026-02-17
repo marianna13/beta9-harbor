@@ -569,22 +569,22 @@ func (s *ContainerRuntimeServer) ContainerSandboxExec(ctx context.Context, in *p
 }
 
 func (s *ContainerRuntimeServer) handleSandboxExec(ctx context.Context, in *pb.ContainerSandboxExecRequest, instance *ContainerInstance, env, cmd []string, cwd string) (*pb.ContainerSandboxExecResponse, error) {
-	// Wait for process manager to be ready (polls the flag set by startup initialization)
-	timeout := time.After(10 * time.Second)
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-
-	for !instance.SandboxProcessManagerReady {
+	// Wait for process manager to be ready via channel notification (no polling)
+	if !instance.SandboxProcessManagerReady {
+		readyChan := instance.SandboxReadyChan
+		if readyChan == nil {
+			return &pb.ContainerSandboxExecResponse{Ok: false, Pid: -1, ErrorMsg: "Process manager channel not initialized"}, nil
+		}
 		select {
-		case <-timeout:
-			return &pb.ContainerSandboxExecResponse{Ok: false, Pid: -1, ErrorMsg: "Process manager not ready within timeout"}, nil
-		case <-ctx.Done():
-			return &pb.ContainerSandboxExecResponse{Ok: false, Pid: -1, ErrorMsg: "Request cancelled"}, nil
-		case <-ticker.C:
-			// Refresh instance to get latest SandboxProcessManagerReady state
+		case <-readyChan:
+			// Ready — refresh instance to get the updated SandboxProcessManager
 			if fresh, exists := s.containerInstances.Get(in.ContainerId); exists {
 				instance = fresh
 			}
+		case <-time.After(60 * time.Second):
+			return &pb.ContainerSandboxExecResponse{Ok: false, Pid: -1, ErrorMsg: "Process manager not ready within timeout"}, nil
+		case <-ctx.Done():
+			return &pb.ContainerSandboxExecResponse{Ok: false, Pid: -1, ErrorMsg: "Request cancelled"}, nil
 		}
 	}
 
@@ -709,6 +709,70 @@ func (s *ContainerRuntimeServer) ContainerSandboxListExposedPorts(ctx context.Co
 	}
 
 	return &pb.ContainerSandboxListExposedPortsResponse{Ok: true, ExposedPorts: ports}, nil
+}
+
+func (s *ContainerRuntimeServer) ContainerSandboxWaitForCompletion(ctx context.Context, in *pb.ContainerSandboxWaitForCompletionRequest) (*pb.ContainerSandboxWaitForCompletionResponse, error) {
+	instance, exists := s.containerInstances.Get(in.ContainerId)
+	if !exists {
+		return &pb.ContainerSandboxWaitForCompletionResponse{
+			Ok:       false,
+			ErrorMsg: "Container not found",
+		}, nil
+	}
+
+	if instance.SandboxProcessManager == nil {
+		return &pb.ContainerSandboxWaitForCompletionResponse{
+			Ok:       false,
+			ErrorMsg: "Process manager not ready",
+		}, nil
+	}
+
+	timeout := time.Duration(in.TimeoutSeconds) * time.Second
+	if timeout <= 0 {
+		timeout = 300 * time.Second
+	}
+
+	deadline := time.Now().Add(timeout)
+	pollInterval := 50 * time.Millisecond
+
+	for {
+		exitCode, err := instance.SandboxProcessManager.Status(int(in.Pid))
+		if err != nil {
+			return &pb.ContainerSandboxWaitForCompletionResponse{
+				Ok:       false,
+				ErrorMsg: err.Error(),
+			}, nil
+		}
+
+		if exitCode >= 0 {
+			stdout, _ := instance.SandboxProcessManager.Stdout(int(in.Pid))
+			stderr, _ := instance.SandboxProcessManager.Stderr(int(in.Pid))
+
+			return &pb.ContainerSandboxWaitForCompletionResponse{
+				Ok:       true,
+				ExitCode: int32(exitCode),
+				Stdout:   stdout,
+				Stderr:   stderr,
+			}, nil
+		}
+
+		if time.Now().After(deadline) {
+			return &pb.ContainerSandboxWaitForCompletionResponse{
+				Ok:       true,
+				TimedOut: true,
+				ExitCode: -1,
+			}, nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return &pb.ContainerSandboxWaitForCompletionResponse{
+				Ok:       false,
+				ErrorMsg: "Request cancelled",
+			}, nil
+		case <-time.After(pollInterval):
+		}
+	}
 }
 
 func (s *ContainerRuntimeServer) ContainerSandboxListProcesses(ctx context.Context, in *pb.ContainerSandboxListProcessesRequest) (*pb.ContainerSandboxListProcessesResponse, error) {

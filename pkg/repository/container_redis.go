@@ -50,7 +50,7 @@ func (cr *ContainerRedisRepository) GetContainerState(containerId string) (*type
 }
 
 func (cr *ContainerRedisRepository) SetContainerState(containerId string, state *types.ContainerState) error {
-	err := cr.lock.Acquire(context.TODO(), common.RedisKeys.SchedulerContainerLock(containerId), common.RedisLockOptions{TtlS: 10, Retries: 0})
+	err := cr.lock.Acquire(context.TODO(), common.RedisKeys.SchedulerContainerLock(containerId), common.RedisLockOptions{TtlS: 10, Retries: 3})
 	if err != nil {
 		return err
 	}
@@ -169,7 +169,7 @@ func (cr *ContainerRedisRepository) UpdateContainerStatus(containerId string, st
 }
 
 func (cr *ContainerRedisRepository) UpdateAssignedContainerGPU(containerId string, gpuType string) error {
-	err := cr.lock.Acquire(context.TODO(), common.RedisKeys.SchedulerContainerLock(containerId), common.RedisLockOptions{TtlS: 10, Retries: 0})
+	err := cr.lock.Acquire(context.TODO(), common.RedisKeys.SchedulerContainerLock(containerId), common.RedisLockOptions{TtlS: 10, Retries: 5})
 	if err != nil {
 		return err
 	}
@@ -525,4 +525,8 @@ func (cr *ContainerRedisRepository) SetBuildContainerTTL(containerId string, ttl
 
 func (cr *ContainerRedisRepository) HasBuildContainerTTL(containerId string) bool {
 	return cr.rdb.Exists(context.TODO(), common.RedisKeys.ImageBuildContainerTTL(containerId)).Val() != 0
+}
+
+func (cr *ContainerRedisRepository) DeleteBuildContainerTTL(containerId string) error {
+	return cr.rdb.Del(context.TODO(), common.RedisKeys.ImageBuildContainerTTL(containerId)).Err()
 }

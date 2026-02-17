@@ -221,6 +221,31 @@ func (s *Worker) RunContainer(ctx context.Context, request *types.ContainerReque
 	// Handle stdout/stderr
 	go s.containerLogger.CaptureLogs(request, logChan)
 
+	// Clip v2 build short-circuit: For v2 builds, skip PullLazy entirely.
+	// The image is built via buildah and archived as a .clip file — no runc
+	// container or FUSE mount is needed. Just build, set exit code, and return.
+	isV2Build := request.IsBuildRequest() && s.config.ImageService.ClipVersion == uint32(types.ClipVersion2)
+	if isV2Build {
+		// Build the image (buildah + clip archive + push to /images/)
+		if err := s.buildOrPullBaseImage(ctx, request, containerId, outputLogger); err != nil {
+			return err
+		}
+		log.Info().Str("container_id", containerId).Msg("v2 build complete, setting exit code")
+		exitCode := 0
+		_, err := handleGRPCResponse(s.containerRepoClient.SetContainerExitCode(context.Background(), &pb.SetContainerExitCodeRequest{
+			ContainerId: containerId,
+			ExitCode:    int32(exitCode),
+		}))
+		if err != nil {
+			log.Error().Str("container_id", containerId).Msgf("failed to set exit code: %v", err)
+		}
+		s.containerWg.Add(1)
+		go func() {
+			s.finalizeContainer(containerId, request, &exitCode)
+		}()
+		return nil
+	}
+
 	// Attempt to pull image
 	outputLogger.Info(fmt.Sprintf("Loading image <%s>...\n", request.ImageId))
 	elapsed, err := s.imageClient.PullLazy(ctx, request, outputLogger)
@@ -244,22 +269,6 @@ func (s *Worker) RunContainer(ctx context.Context, request *types.ContainerReque
 		}
 	}
 	outputLogger.Info(fmt.Sprintf("Loaded image <%s>, took: %s\n", request.ImageId, elapsed))
-
-	// Clip v2 build short-circuit: For v2 builds, the image was already built via buildah
-	// (see buildOrPullBaseImage) and indexed as a .clip archive. We don't need to run a
-	// runc container or execute any commands inside it. Mark the build as successful and exit.
-	if request.IsBuildRequest() && s.config.ImageService.ClipVersion == uint32(types.ClipVersion2) {
-		exitCode := 0
-		_, _ = handleGRPCResponse(s.containerRepoClient.SetContainerExitCode(context.Background(), &pb.SetContainerExitCodeRequest{
-			ContainerId: containerId,
-			ExitCode:    int32(exitCode),
-		}))
-		s.containerWg.Add(1)
-		go func() {
-			s.finalizeContainer(containerId, request, &exitCode)
-		}()
-		return nil
-	}
 
 	// Determine how many ports we need to expose
 	portsToExpose := len(request.Ports)
@@ -412,18 +421,64 @@ func (s *Worker) readBundleConfig(request *types.ContainerRequest) (*specs.Spec,
 // V1 images always have a config.json, so if we're here, it's a v2 image.
 func (s *Worker) deriveSpecFromV2Image(request *types.ContainerRequest) (*specs.Spec, error) {
 	clipMeta, ok := s.imageClient.GetCLIPImageMetadata(request.ImageId)
-	if !ok {
-		log.Warn().
+	if ok {
+		log.Info().
 			Str("image_id", request.ImageId).
-			Msg("no metadata found in v2 image archive, using base spec")
-		return nil, nil
+			Msg("using metadata from v2 clip archive")
+		return s.buildSpecFromCLIPMetadata(clipMeta), nil
 	}
 
-	log.Info().
-		Str("image_id", request.ImageId).
-		Msg("using metadata from v2 clip archive")
+	// Fallback: try to get metadata via skopeo inspection of the registry image
+	sourceRef, hasRef := s.imageClient.GetSourceImageRef(request.ImageId)
+	if hasRef {
+		log.Info().
+			Str("image_id", request.ImageId).
+			Str("source_ref", sourceRef).
+			Msg("no CLIP metadata found, trying skopeo inspection")
 
-	return s.buildSpecFromCLIPMetadata(clipMeta), nil
+		ctx := context.Background()
+		imageMeta, err := s.imageClient.InspectImage(ctx, sourceRef, request.BuildRegistryCredentials)
+		if err == nil {
+			log.Info().
+				Str("image_id", request.ImageId).
+				Msg("using metadata from skopeo inspection")
+			return s.buildSpecFromSkopeoMetadata(imageMeta), nil
+		}
+		log.Warn().
+			Str("image_id", request.ImageId).
+			Err(err).
+			Msg("skopeo inspection failed, using base spec")
+	} else {
+		log.Warn().
+			Str("image_id", request.ImageId).
+			Msg("no metadata found in v2 image archive and no source ref cached, using base spec")
+	}
+
+	return nil, nil
+}
+
+// buildSpecFromSkopeoMetadata constructs an OCI spec from skopeo-inspected image metadata
+func (s *Worker) buildSpecFromSkopeoMetadata(imageMeta common.ImageMetadata) *specs.Spec {
+	spec := specs.Spec{
+		Process: &specs.Process{
+			Env: []string{},
+		},
+	}
+
+	if len(imageMeta.Env) > 0 {
+		spec.Process.Env = imageMeta.Env
+	}
+	if imageMeta.WorkingDir != "" {
+		spec.Process.Cwd = imageMeta.WorkingDir
+	}
+	// Combine Entrypoint and Cmd, or use Cmd alone
+	if len(imageMeta.Entrypoint) > 0 {
+		spec.Process.Args = append(imageMeta.Entrypoint, imageMeta.Cmd...)
+	} else if len(imageMeta.Cmd) > 0 {
+		spec.Process.Args = imageMeta.Cmd
+	}
+
+	return &spec
 }
 
 // buildSpecFromCLIPMetadata constructs an OCI spec from CLIP image metadata
@@ -468,7 +523,8 @@ func (s *Worker) specFromRequest(request *types.ContainerRequest, options *Conta
 	spec.Process.Args = request.EntryPoint
 	spec.Process.Terminal = false
 
-	if request.Stub.Type.Kind() == types.StubTypePod && options.InitialSpec != nil {
+	stubKind := request.Stub.Type.Kind()
+	if (stubKind == types.StubTypePod || stubKind == types.StubTypeSandbox) && options.InitialSpec != nil {
 		if len(request.EntryPoint) == 0 {
 			log.Info().
 				Str("container_id", request.ContainerId).
@@ -479,7 +535,10 @@ func (s *Worker) specFromRequest(request *types.ContainerRequest, options *Conta
 			spec.Process.Args = options.InitialSpec.Process.Args
 		}
 
-		spec.Process.Cwd = options.InitialSpec.Process.Cwd
+		// Only override Cwd if InitialSpec has a non-empty value (e.g., from Dockerfile WORKDIR)
+		if options.InitialSpec.Process.Cwd != "" {
+			spec.Process.Cwd = options.InitialSpec.Process.Cwd
+		}
 		spec.Process.User.UID = options.InitialSpec.Process.User.UID
 		spec.Process.User.GID = options.InitialSpec.Process.User.GID
 	}
@@ -668,6 +727,10 @@ func (s *Worker) getContainerEnvironment(request *types.ContainerRequest, option
 	// Add env vars from initial spec. This would be the case for regular workers, not build workers.
 	if options.InitialSpec != nil {
 		env = append(options.InitialSpec.Process.Env, env...)
+	} else {
+		// When no InitialSpec is available (e.g., v2 images without metadata),
+		// add default PATH to ensure basic commands work
+		env = append(env, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
 	}
 
 	return env
@@ -828,6 +891,7 @@ func (s *Worker) spawn(request *types.ContainerRequest, spec *specs.Spec, output
 		}
 
 		instance.SandboxProcessManagerReady = false
+		instance.SandboxReadyChan = make(chan struct{})
 		s.containerInstances.Set(containerId, instance)
 
 		spec.Process.Args = []string{types.WorkerSandboxProcessManagerContainerPath}
@@ -909,6 +973,9 @@ func (s *Worker) spawn(request *types.ContainerRequest, spec *specs.Spec, output
 				// Wait for process manager to be ready - this blocks until ready or timeout
 				if s.waitForProcessManager(ctx, containerId, instance) {
 					instance.SandboxProcessManagerReady = true
+					if instance.SandboxReadyChan != nil {
+						close(instance.SandboxReadyChan)
+					}
 					s.containerInstances.Set(containerId, instance)
 
 					// Now that process manager is ready, start Docker daemon if enabled

@@ -14,11 +14,10 @@ const (
 	// 2. Setup cgroups (fast, ~100ms)
 	// 3. Start dockerd in background
 	// 4. Wait up to 30s for dockerd to be ready (usually takes 2-5s)
-	goprocReadyTimeout             = 10 * time.Second
-	goprocInitialBackoff           = 100 * time.Millisecond
-	goprocMaxBackoff               = 2 * time.Second
-	goprocBackoffMultiplier        = 1.5
-	goprocCommandCompletionWait    = 100 * time.Millisecond
+	goprocInitialBackoff           = 50 * time.Millisecond
+	goprocMaxBackoff               = 500 * time.Millisecond
+	goprocBackoffMultiplier        = 1.2
+	goprocCommandCompletionWait    = 50 * time.Millisecond
 	cgroupSetupCompletionWait      = 500 * time.Millisecond
 	dockerDaemonStartupTimeout     = 30 * time.Second
 	dockerDaemonReadyPollInterval  = 1 * time.Second
@@ -117,23 +116,27 @@ func (s *Worker) enableIPv4Forwarding(ctx context.Context, containerId string, i
 	return nil
 }
 
-// waitForProcessManager waits for the goproc process manager to be ready to accept commands
-// Uses exponential backoff to efficiently wait for goproc startup
-// This should be called ONCE during container initialization, not on every exec
+// waitForProcessManager waits for the goproc process manager to be ready to accept commands.
+// Loops indefinitely with exponential backoff until goproc responds or context is cancelled.
+// Context cancellation happens when the container is stopped/terminated.
 func (s *Worker) waitForProcessManager(ctx context.Context, containerId string, instance *ContainerInstance) bool {
 	start := time.Now()
 	backoff := goprocInitialBackoff
 
-	for time.Since(start) < goprocReadyTimeout {
+	for {
 		select {
 		case <-ctx.Done():
+			log.Warn().
+				Str("container_id", containerId).
+				Dur("waited", time.Since(start)).
+				Msg("context cancelled while waiting for process manager")
 			return false
 		default:
 		}
 
 		// Try a simple echo command to check if goproc is ready
 		pid, err := instance.SandboxProcessManager.Exec(
-			[]string{"echo", "ready"},
+			[]string{"/bin/echo", "ready"},
 			"/",
 			[]string{},
 			false,
@@ -158,12 +161,6 @@ func (s *Worker) waitForProcessManager(ctx context.Context, containerId string, 
 			backoff = goprocMaxBackoff
 		}
 	}
-
-	log.Error().
-		Str("container_id", containerId).
-		Msg("process manager did not become ready within timeout")
-
-	return false
 }
 
 // waitForDockerDaemon waits for the Docker daemon to be ready to accept commands

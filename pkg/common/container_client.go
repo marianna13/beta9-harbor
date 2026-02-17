@@ -144,6 +144,14 @@ func (c *ContainerClient) SandboxStderr(containerId string, pid int32) (*pb.Cont
 	return resp, nil
 }
 
+func (c *ContainerClient) SandboxWaitForCompletion(containerId string, pid int32, timeoutSeconds int32) (*pb.ContainerSandboxWaitForCompletionResponse, error) {
+	resp, err := c.client.ContainerSandboxWaitForCompletion(context.TODO(), &pb.ContainerSandboxWaitForCompletionRequest{ContainerId: containerId, Pid: pid, TimeoutSeconds: timeoutSeconds})
+	if err != nil {
+		return resp, err
+	}
+	return resp, nil
+}
+
 func (c *ContainerClient) SandboxKill(containerId string, pid int32) (*pb.ContainerSandboxKillResponse, error) {
 	resp, err := c.client.ContainerSandboxKill(context.TODO(), &pb.ContainerSandboxKillRequest{ContainerId: containerId, Pid: pid})
 	if err != nil {

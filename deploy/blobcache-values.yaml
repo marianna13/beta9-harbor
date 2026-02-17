@@ -1,0 +1,23 @@
+blobcache:
+  enabled: true
+  persistence:
+    cache:
+      enabled: true
+      type: hostPath
+      hostPath: /mnt/data/blobcache
+      hostPathType: DirectoryOrCreate
+      globalMounts:
+        - path: /cache
+  controllers:
+    main:
+      replicas: 1
+      strategy: Recreate
+      containers:
+        main:
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: 4000m
+              memory: 8Gi

@@ -269,6 +269,7 @@ func (wpc *LocalKubernetesWorkerPoolController) createWorkerJob(workerId string,
 	}
 
 	ttl := int32(30)
+	activeDeadline := int64(7200) // 2 hours max worker lifetime to prevent accumulation
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      jobName,
@@ -278,6 +279,7 @@ func (wpc *LocalKubernetesWorkerPoolController) createWorkerJob(workerId string,
 		Spec: batchv1.JobSpec{
 			Template:                podTemplate,
 			TTLSecondsAfterFinished: &ttl,
+			ActiveDeadlineSeconds:   &activeDeadline,
 		},
 	}
 

@@ -24,7 +24,7 @@ const (
 	defaultBuildContainerCpu           int64         = 1000
 	defaultBuildContainerMemory        int64         = 1024
 	defaultContainerSpinupTimeout      time.Duration = 600 * time.Second
-	dockerfileContainerSpinupTimeout   time.Duration = 1 * time.Hour
+	dockerfileContainerSpinupTimeout   time.Duration = 5 * time.Minute
 
 	pipCommandType        string = "pip"
 	shellCommandType      string = "shell"
@@ -238,6 +238,9 @@ func (b *Builder) Build(ctx context.Context, opts *BuildOpts, outputChan chan co
 			return err
 		}
 	}
+
+	// Delete the build container TTL key so it won't expire later and trigger stop storms
+	b.containerRepo.DeleteBuildContainerTTL(build.containerID)
 
 	// Send final completion message with image ID
 	build.setSuccess(true)
@@ -544,6 +547,10 @@ func (b *Builder) stopBuild(containerId string) error {
 
 func (b *Builder) handleBuildCancellation(ctx context.Context, build *Build) {
 	<-ctx.Done()
+
+	// Always delete the TTL key to prevent expiry-triggered stop storms
+	b.containerRepo.DeleteBuildContainerTTL(build.containerID)
+
 	if build.success.Load() {
 		return
 	}

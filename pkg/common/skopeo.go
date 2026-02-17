@@ -53,7 +53,10 @@ type ImageMetadata struct {
 		Size        int    `json:"Size"`
 		Annotations any    `json:"Annotations"`
 	} `json:"LayersData"`
-	Env []string `json:"Env"`
+	Env        []string `json:"Env"`
+	WorkingDir string   `json:"WorkingDir"`
+	Entrypoint []string `json:"Entrypoint"`
+	Cmd        []string `json:"Cmd"`
 }
 
 func NewSkopeoClient(config types.AppConfig) SkopeoClient {

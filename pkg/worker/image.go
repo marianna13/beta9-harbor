@@ -2,7 +2,11 @@ package worker
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -304,6 +308,8 @@ func (c *ImageClient) PullLazy(ctx context.Context, request *types.ContainerRequ
 		// v2: ClipFS reads embedded OCI storage info from archive
 		mountOptions.StorageInfo = nil
 		mountOptions.RegistryCredProvider = c.getCredentialProviderForImage(ctx, imageId, request)
+		// All v2 clips are built against the build registry; use its insecure setting
+		mountOptions.Insecure = c.config.ImageService.BuildRegistryInsecure
 	} else {
 		// v1 (legacy S3 data-carrying)
 		mountOptions.Credentials = storage.ClipStorageCredentials{
@@ -346,7 +352,6 @@ func (c *ImageClient) PullLazy(ctx context.Context, request *types.ContainerRequ
 	if err != nil {
 		return elapsed, err
 	}
-
 	err = startServer()
 	if err != nil {
 		return elapsed, err
@@ -411,6 +416,11 @@ func (c *ImageClient) cacheOCIMetadata(imageId string, meta *clipCommon.ClipArch
 // GetSourceImageRef retrieves the cached source image reference for a v2 image
 func (c *ImageClient) GetSourceImageRef(imageId string) (string, bool) {
 	return c.v2ImageRefs.Get(imageId)
+}
+
+// InspectImage uses skopeo to inspect an image and return its metadata
+func (c *ImageClient) InspectImage(ctx context.Context, imageRef string, creds string) (common.ImageMetadata, error) {
+	return c.skopeoClient.Inspect(ctx, imageRef, creds, nil)
 }
 
 // GetCLIPImageMetadata extracts CLIP image metadata from the archive
@@ -541,6 +551,57 @@ func (c *ImageClient) Cleanup() error {
 	return nil
 }
 
+// validateClipFile checks that the file at path has a valid CLIP archive header
+// AND that the file size is large enough to contain the storage info section.
+// A header-only check is insufficient because NFS attribute caching can serve
+// stale/truncated file content after a concurrent rename on another node.
+func validateClipFile(path string) bool {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	fileSize := fi.Size()
+	if fileSize < clipCommon.ClipHeaderLength {
+		return false
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+
+	header := make([]byte, clipCommon.ClipHeaderLength)
+	if _, err := io.ReadFull(f, header); err != nil {
+		return false
+	}
+
+	// Check magic bytes (first 9 bytes)
+	for i, b := range clipCommon.ClipFileStartBytes {
+		if header[i] != b {
+			return false
+		}
+	}
+
+	// Parse StorageInfoPos (bytes 28-35) and StorageInfoLength (bytes 20-27)
+	// from the header to verify the file isn't truncated.
+	// Header layout: StartBytes[9] + Version[1] + IndexLen[8] + IndexPos[8] + StorageInfoLen[8] + StorageInfoPos[8] + Type[12]
+	storageInfoLen := int64(binary.BigEndian.Uint64(header[20:28]))
+	storageInfoPos := int64(binary.BigEndian.Uint64(header[28:36]))
+
+	// The file must be large enough to hold the storage info section
+	if storageInfoPos+storageInfoLen > fileSize {
+		log.Warn().
+			Int64("file_size", fileSize).
+			Int64("storage_info_end", storageInfoPos+storageInfoLen).
+			Str("path", path).
+			Msg("CLIP file truncated (storage info extends beyond file size)")
+		return false
+	}
+
+	return true
+}
+
 func (c *ImageClient) pullImageFromRegistry(ctx context.Context, archivePath string, imageId string) (*types.S3ImageRegistryConfig, error) {
 	sourceRegistry := c.config.ImageService.Registries.S3
 
@@ -565,34 +626,63 @@ func (c *ImageClient) pullImageFromRegistry(ctx context.Context, archivePath str
 
 	// Check if file exists now that we have the lock (another worker may have downloaded it)
 	if _, err := os.Stat(archivePath); err == nil {
-		return &sourceRegistry, nil
+		// Validate header to catch NFS-corrupted cached files
+		if validateClipFile(archivePath) {
+			return &sourceRegistry, nil
+		}
+		log.Warn().Str("image_id", imageId).Msg("cached image has corrupt header, re-downloading")
+		os.Remove(archivePath)
 	}
 
-	// Download to temp file, then atomically rename
-	tempPath := archivePath + ".tmp"
+	// Download to temp file with cryptographically unique name.
+	// os.Getpid() returns 1 in every k8s container (PID namespace), so
+	// PID-based names collide across workers on the same NFS mount.
+	randBytes := make([]byte, 8)
+	rand.Read(randBytes)
+	tempPath := fmt.Sprintf("%s.tmp.%s", archivePath, hex.EncodeToString(randBytes))
 	defer os.Remove(tempPath)
 
-	if err = c.registry.Pull(ctx, tempPath, imageId); err != nil {
-		if c.config.ImageService.RegistryStore == registry.LocalImageRegistryStore {
-			if s3Registry, e2 := registry.NewImageRegistry(c.config, c.config.ImageService.Registries.S3); e2 == nil {
-				_ = c.registry.CopyImageFromRegistry(ctx, imageId, s3Registry)
-				if err2 := c.registry.Pull(ctx, tempPath, imageId); err2 == nil {
-					err = nil
-				} else {
-					err = err2
+	// Try pulling up to 2 times — the first attempt may get a truncated file
+	// due to transient S3/network issues.
+	const maxPullAttempts = 2
+	for pullAttempt := 0; pullAttempt < maxPullAttempts; pullAttempt++ {
+		os.Remove(tempPath) // clean up any previous attempt
+
+		if err = c.registry.Pull(ctx, tempPath, imageId); err != nil {
+			if c.config.ImageService.RegistryStore == registry.LocalImageRegistryStore {
+				if s3Registry, e2 := registry.NewImageRegistry(c.config, c.config.ImageService.Registries.S3); e2 == nil {
+					_ = c.registry.CopyImageFromRegistry(ctx, imageId, s3Registry)
+					if err2 := c.registry.Pull(ctx, tempPath, imageId); err2 == nil {
+						err = nil
+					} else {
+						err = err2
+					}
 				}
 			}
+			if err != nil {
+				log.Error().Err(err).Str("image_id", imageId).Msg("failed to pull image from registry")
+				return nil, err
+			}
 		}
-		if err != nil {
-			log.Error().Err(err).Str("image_id", imageId).Msg("failed to pull image from registry")
-			return nil, err
+
+		// Validate the downloaded file before committing
+		if validateClipFile(tempPath) {
+			break // good download
 		}
+
+		if pullAttempt < maxPullAttempts-1 {
+			log.Warn().Str("image_id", imageId).Int("attempt", pullAttempt+1).Msg("downloaded image failed validation, retrying")
+			continue
+		}
+		os.Remove(tempPath)
+		return nil, fmt.Errorf("downloaded image %s failed validation after %d attempts", imageId, maxPullAttempts)
 	}
 
 	if err := os.Rename(tempPath, archivePath); err != nil {
 		return nil, err
 	}
 
+	log.Info().Str("image_id", imageId).Msg("pullImageFromRegistry: done")
 	return &sourceRegistry, nil
 }
 
@@ -630,13 +720,12 @@ func (c *ImageClient) getBuildRegistry() string {
 	return "localhost"
 }
 
-// setupBuildahDirs creates and returns optimal paths for buildah operations using /dev/shm
-// All paths use tmpfs (/dev/shm) for fast I/O and to avoid slow disk bottlenecks
+// setupBuildahDirs creates and returns optimal paths for buildah operations.
+// Uses /tmp for graphroot and tmpdir (ext4, overlay-compatible) and /dev/shm for runroot (fast metadata).
 func (c *ImageClient) setupBuildahDirs() (graphroot, runroot, tmpdir string) {
-	// Use /dev/shm for all paths - tmpfs is fast and overlay can work here for builds
-	graphroot = filepath.Join("/dev/shm", "buildah-storage")
+	graphroot = filepath.Join("/tmp", "buildah-storage")
 	runroot = filepath.Join("/dev/shm", "buildah-run")
-	tmpdir = filepath.Join("/dev/shm", "buildah-tmp")
+	tmpdir = filepath.Join("/tmp", "buildah-tmp")
 
 	// Create directories with proper permissions
 	_ = os.MkdirAll(graphroot, 0o700)
@@ -746,7 +835,7 @@ func (c *ImageClient) getBuildahAuthArgs(ctx context.Context, imageRef string, c
 	return nil
 }
 
-func (c *ImageClient) createOCIImageWithProgress(ctx context.Context, outputLogger *slog.Logger, request *types.ContainerRequest, imageRef, outputPath string, checkpointMiB int64) error {
+func (c *ImageClient) createOCIImageWithProgress(ctx context.Context, outputLogger *slog.Logger, request *types.ContainerRequest, imageRef, outputPath string, checkpointMiB int64, insecure bool) error {
 	outputLogger.Info("Indexing image...\n")
 	progressChan := make(chan clip.OCIIndexProgress, 100)
 
@@ -802,6 +891,7 @@ func (c *ImageClient) createOCIImageWithProgress(ctx context.Context, outputLogg
 		CheckpointMiB: checkpointMiB,
 		ProgressChan:  progressChan,
 		CredProvider:  c.getCredentialProviderForImage(ctx, request.ImageId, request),
+		Insecure:      insecure,
 	})
 
 	// Close channel and wait for all progress messages to be logged
@@ -883,7 +973,15 @@ func (c *ImageClient) BuildAndArchiveImage(ctx context.Context, outputLogger *sl
 		sourceImage = *request.BuildOptions.SourceImage
 	}
 
-	if sourceImage != "" {
+	// If no source image is provided but we have a Dockerfile, parse the FROM instruction
+	if sourceImage == "" && request.BuildOptions.Dockerfile != nil && *request.BuildOptions.Dockerfile != "" {
+		sourceImage = parseDockerfileBaseImage(*request.BuildOptions.Dockerfile)
+		if sourceImage != "" {
+			log.Info().Str("container_id", request.ContainerId).Str("base_image", sourceImage).Msg("parsed base image from Dockerfile")
+		}
+	}
+
+	if sourceImage != "" && sourceImage != "scratch" {
 		insecure = c.config.ImageService.BuildRegistryInsecure
 
 		// buildah pull the base image so bud doesn't attempt HTTPS
@@ -915,6 +1013,12 @@ func (c *ImageClient) BuildAndArchiveImage(ctx context.Context, outputLogger *sl
 	budArgs = append(budArgs, "--layers")           // Enable layer caching for faster rebuilds
 	budArgs = append(budArgs, "--format", "docker") // Use docker format to avoid conversion at push time
 	budArgs = append(budArgs, "--jobs", "8")        // Use parallel jobs for faster layer processing
+
+	// Registry-based layer cache sharing across all build workers
+	buildRegistryForCache := c.getBuildRegistry()
+	cacheRepo := fmt.Sprintf("%s/%s/cache", buildRegistryForCache, c.config.ImageService.BuildRepositoryName)
+	budArgs = append(budArgs, "--cache-from", cacheRepo)
+	budArgs = append(budArgs, "--cache-to", cacheRepo)
 
 	// Add credentials for multi-stage builds and private base images
 	if authArgs := c.getBuildahAuthArgs(ctx, sourceImage, request.BuildOptions.SourceImageCreds); len(authArgs) > 0 {
@@ -978,7 +1082,8 @@ func (c *ImageClient) BuildAndArchiveImage(ctx context.Context, outputLogger *sl
 		log.Info().Str("image_id", request.ImageId).Str("image_tag", imageTag).Msg("cached image reference")
 
 		// Create the image index (CLIP archive)
-		if err = c.createOCIImageWithProgress(ctx, outputLogger, request, imageTag, archivePath, 2); err != nil {
+		// Use insecure transport if build registry is configured as insecure
+		if err = c.createOCIImageWithProgress(ctx, outputLogger, request, imageTag, archivePath, 2, c.config.ImageService.BuildRegistryInsecure); err != nil {
 			return err
 		}
 
@@ -1084,7 +1189,8 @@ func (c *ImageClient) PullAndArchiveImage(ctx context.Context, outputLogger *slo
 		archivePath := filepath.Join("/dev/shm", archiveName)
 
 		// Create index-only clip from the source docker image reference with progress reporting
-		if err = c.createOCIImageWithProgress(ctx, outputLogger, request, *request.BuildOptions.SourceImage, archivePath, 2); err != nil {
+		// External images typically use HTTPS, so insecure=false
+		if err = c.createOCIImageWithProgress(ctx, outputLogger, request, *request.BuildOptions.SourceImage, archivePath, 2, false); err != nil {
 			return err
 		}
 
@@ -1236,4 +1342,26 @@ func (c *ImageClient) getBuildContext(buildPath string, request *types.Container
 	}
 
 	return buildCtxPath, nil
+}
+
+// parseDockerfileBaseImage extracts the base image from the first FROM instruction in a Dockerfile
+func parseDockerfileBaseImage(dockerfile string) string {
+	lines := strings.Split(dockerfile, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		// Skip comments and empty lines
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		// Check for FROM instruction (case-insensitive)
+		if strings.HasPrefix(strings.ToUpper(line), "FROM ") {
+			parts := strings.Fields(line)
+			if len(parts) >= 2 {
+				baseImage := parts[1]
+				// Handle "FROM image AS builder" syntax
+				return baseImage
+			}
+		}
+	}
+	return ""
 }

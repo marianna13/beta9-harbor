@@ -23,55 +23,17 @@ RUN if [ "$(uname -m)" = "x86_64" ]; then \
     chmod +x /usr/local/bin/geesefs; \
     fi
 
-# skopeo
-# ========================
-FROM golang AS skopeo
-
-WORKDIR /workspace
-
-ENV CGO_ENABLED="0"  \
-    DISABLE_DOCS="1" \
-    GO_DYN_FLAGS=""  \
-    BUILDTAGS="containers_image_openpgp"
-
-RUN <<EOT
-set -eux
-git clone https://github.com/containers/skopeo.git .
-make
-make install
-/usr/local/bin/skopeo --version
-EOT
-
-# Target used in development environments
 FROM base AS build
 
 WORKDIR /workspace
 
-RUN apt-get install -y libfuse3-dev libbtrfs-dev libgpgme-dev && \
-    go install github.com/cosmtrek/air@v1.49.0
+RUN apt-get install -y libfuse3-dev libbtrfs-dev libgpgme-dev
 
 COPY go.mod go.sum ./
-COPY clip-lib ./clip-lib
 RUN go mod download && go mod verify
 
-COPY --from=skopeo /usr/local/bin/skopeo /usr/local/bin/skopeo
-COPY --from=skopeo /workspace/default-policy.json /etc/containers/policy.json
 COPY . .
 
 RUN go build -o /usr/local/bin/gateway /workspace/cmd/gateway/main.go
 
-
-# Target used in production-like environments
-FROM base AS release
-
-WORKDIR /workspace
-
-RUN apt-get autoclean
-
-COPY --from=build /usr/local/bin/gateway /usr/local/bin/
-COPY --from=skopeo /usr/local/bin/skopeo /usr/local/bin/skopeo
-COPY --from=skopeo /workspace/default-policy.json /etc/containers/policy.json
-RUN /usr/local/bin/skopeo --version
-
-
-CMD ["tail", "-f", "/dev/null"]
+CMD ["/usr/local/bin/gateway"]

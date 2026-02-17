@@ -403,6 +403,7 @@ func (wpc *ExternalWorkerPoolController) createWorkerJob(workerId, machineId str
 	}
 
 	ttl := int32(30)
+	activeDeadline := int64(7200) // 2 hours max worker lifetime to prevent accumulation
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      jobName,
@@ -412,6 +413,7 @@ func (wpc *ExternalWorkerPoolController) createWorkerJob(workerId, machineId str
 		Spec: batchv1.JobSpec{
 			Template:                podTemplate,
 			TTLSecondsAfterFinished: &ttl,
+			ActiveDeadlineSeconds:   &activeDeadline,
 		},
 	}
 

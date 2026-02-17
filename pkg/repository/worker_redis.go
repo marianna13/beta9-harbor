@@ -355,7 +355,7 @@ func (r *WorkerRedisRepository) GetGpuAvailability() (map[string]bool, error) {
 }
 
 func (r *WorkerRedisRepository) GetAllWorkers() ([]*types.Worker, error) {
-	workers, err := r.getWorkers(true)
+	workers, err := r.getWorkers(false)
 	if err != nil {
 		return nil, err
 	}
@@ -608,15 +608,21 @@ func (r *WorkerRedisRepository) GetContainerIp(networkPrefix string, containerId
 }
 
 func (r *WorkerRedisRepository) SetContainerIp(networkPrefix string, containerId, containerIp string) error {
-	err := r.rdb.Set(context.TODO(), common.RedisKeys.WorkerNetworkContainerIp(networkPrefix, containerId), containerIp, 0).Err()
+	err := r.rdb.Set(context.TODO(), common.RedisKeys.WorkerNetworkContainerIp(networkPrefix, containerId), containerIp, time.Hour).Err()
 	if err != nil {
 		return err
 	}
 
-	err = r.rdb.SAdd(context.TODO(), common.RedisKeys.WorkerNetworkIpIndex(networkPrefix), containerIp).Err()
+	ipIndexKey := common.RedisKeys.WorkerNetworkIpIndex(networkPrefix)
+	err = r.rdb.SAdd(context.TODO(), ipIndexKey, containerIp).Err()
 	if err != nil {
 		return err
 	}
+
+	// Keep the ip_index set alive as long as containers are being assigned.
+	// When all containers are gone (no new SetContainerIp calls), the set
+	// will expire and stale IPs are reclaimed automatically.
+	r.rdb.Expire(context.TODO(), ipIndexKey, 2*time.Hour)
 
 	return nil
 }

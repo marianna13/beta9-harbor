@@ -293,15 +293,46 @@ func (s *LocalObjectStore) Put(ctx context.Context, localPath string, key string
 	defer srcFile.Close()
 
 	destPath := filepath.Join(s.Path, key)
-	destFile, err := os.Create(destPath)
+	tmpPath := destPath + ".tmp"
+	destFile, err := os.Create(tmpPath)
 	if err != nil {
 		return err
 	}
-	defer destFile.Close()
 
-	_, err = io.Copy(destFile, srcFile)
+	// Wrap srcFile to prevent Go from detecting *os.File and using sendfile/splice,
+	// which hangs on NFS (same fix as Get). Use buffered copy instead.
+	buf := make([]byte, 256*1024) // 256KB buffer
+	n, err := io.CopyBuffer(destFile, struct{ io.Reader }{srcFile}, buf)
 	if err != nil {
+		destFile.Close()
+		os.Remove(tmpPath)
 		return err
+	}
+
+	// Sync to ensure data is flushed to NFS server before rename
+	if err := destFile.Sync(); err != nil {
+		destFile.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("put %s: sync failed: %w", key, err)
+	}
+	destFile.Close()
+
+	if n == 0 {
+		// Source file was empty — something is wrong, don't create a 0-byte clip
+		os.Remove(tmpPath)
+		return fmt.Errorf("put %s: source file %s is empty (0 bytes copied)", key, localPath)
+	}
+
+	// Atomic rename to prevent partial/corrupt files from being visible
+	if err := os.Rename(tmpPath, destPath); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("put %s: rename failed: %w", key, err)
+	}
+
+	// Verify the file on disk is not empty (belt-and-suspenders for NFS)
+	if fi, err := os.Stat(destPath); err == nil && fi.Size() == 0 {
+		os.Remove(destPath)
+		return fmt.Errorf("put %s: file is 0 bytes after rename (wrote %d bytes); NFS cache issue", key, n)
 	}
 
 	return nil
@@ -321,7 +352,10 @@ func (s *LocalObjectStore) Get(ctx context.Context, key string, localPath string
 	}
 	defer destFile.Close()
 
-	_, err = io.Copy(destFile, srcFile)
+	// Wrap srcFile in a plain io.Reader to prevent Go from using
+	// sendfile/splice syscalls, which hang on NFS-to-NFS copies.
+	buf := make([]byte, 256*1024)
+	_, err = io.CopyBuffer(destFile, struct{ io.Reader }{srcFile}, buf)
 	if err != nil {
 		return err
 	}

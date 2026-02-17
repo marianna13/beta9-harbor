@@ -343,6 +343,23 @@ class PodSandboxListUrlsResponse(betterproto.Message):
     error_msg: str = betterproto.string_field(3)
 
 
+@dataclass(eq=False, repr=False)
+class PodSandboxWaitForCompletionRequest(betterproto.Message):
+    container_id: str = betterproto.string_field(1)
+    pid: int = betterproto.int32_field(2)
+    timeout_seconds: int = betterproto.int32_field(3)
+
+
+@dataclass(eq=False, repr=False)
+class PodSandboxWaitForCompletionResponse(betterproto.Message):
+    ok: bool = betterproto.bool_field(1)
+    error_msg: str = betterproto.string_field(2)
+    exit_code: int = betterproto.int32_field(3)
+    stdout: str = betterproto.string_field(4)
+    stderr: str = betterproto.string_field(5)
+    timed_out: bool = betterproto.bool_field(6)
+
+
 class PodServiceStub(SyncServiceStub):
     def create_pod(self, create_pod_request: "CreatePodRequest") -> "CreatePodResponse":
         return self._unary_unary(
@@ -550,3 +567,13 @@ class PodServiceStub(SyncServiceStub):
             PodSandboxListUrlsRequest,
             PodSandboxListUrlsResponse,
         )(pod_sandbox_list_urls_request)
+
+    def sandbox_wait_for_completion(
+        self,
+        pod_sandbox_wait_for_completion_request: "PodSandboxWaitForCompletionRequest",
+    ) -> "PodSandboxWaitForCompletionResponse":
+        return self._unary_unary(
+            "/pod.PodService/SandboxWaitForCompletion",
+            PodSandboxWaitForCompletionRequest,
+            PodSandboxWaitForCompletionResponse,
+        )(pod_sandbox_wait_for_completion_request)

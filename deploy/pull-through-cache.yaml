@@ -1,0 +1,95 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pull-through-cache-config
+  namespace: beta9
+data:
+  config.yml: |
+    version: 0.1
+    log:
+      fields:
+        service: registry
+    storage:
+      cache:
+        blobdescriptor: inmemory
+      filesystem:
+        rootdirectory: /var/lib/registry
+    http:
+      addr: :5000
+      headers:
+        X-Content-Type-Options: [nosniff]
+    proxy:
+      remoteurl: https://registry-1.docker.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pull-through-cache
+  namespace: beta9
+  labels:
+    app: pull-through-cache
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pull-through-cache
+  template:
+    metadata:
+      labels:
+        app: pull-through-cache
+    spec:
+      containers:
+      - name: registry
+        image: 10.43.163.160:5000/library/registry:2
+        ports:
+        - containerPort: 5000
+          protocol: TCP
+        volumeMounts:
+        - name: config
+          mountPath: /etc/docker/registry
+        - name: data
+          mountPath: /var/lib/registry
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 1000m
+            memory: 2Gi
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 5000
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 5000
+          initialDelaySeconds: 5
+          periodSeconds: 10
+      volumes:
+      - name: config
+        configMap:
+          name: pull-through-cache-config
+      - name: data
+        hostPath:
+          path: /mnt/data/pull-through-cache
+          type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pull-through-cache
+  namespace: beta9
+  labels:
+    app: pull-through-cache
+spec:
+  type: ClusterIP
+  ports:
+  - port: 5000
+    targetPort: 5000
+    protocol: TCP
+    name: http
+  selector:
+    app: pull-through-cache

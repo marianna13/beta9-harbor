@@ -44,7 +44,7 @@ type ImageServiceOpts struct {
 }
 
 const buildContainerKeepAliveIntervalS int = 10
-const imageContainerTtlS int = 60
+const imageContainerTtlS int = 300
 
 func NewContainerImageService(
 	ctx context.Context,
@@ -334,7 +334,7 @@ func (is *ContainerImageService) monitorImageContainers(ctx context.Context) {
 					containerId := strings.TrimPrefix(is.keyEventManager.TrimKeyspacePrefix(event.Key), common.RedisKeys.SchedulerContainerState(""))
 
 					if !is.containerRepo.HasBuildContainerTTL(containerId) {
-						is.builder.scheduler.Stop(&types.StopContainerArgs{
+						go is.builder.scheduler.Stop(&types.StopContainerArgs{
 							ContainerId: containerId,
 							Force:       true,
 							Reason:      types.StopContainerReasonTtl,
@@ -344,7 +344,7 @@ func (is *ContainerImageService) monitorImageContainers(ctx context.Context) {
 			case common.KeyOperationExpired:
 				if strings.Contains(event.Key, common.RedisKeys.ImageBuildContainerTTL("")) {
 					containerId := strings.TrimPrefix(is.keyEventManager.TrimKeyspacePrefix(event.Key), common.RedisKeys.ImageBuildContainerTTL(""))
-					is.builder.scheduler.Stop(&types.StopContainerArgs{
+					go is.builder.scheduler.Stop(&types.StopContainerArgs{
 						ContainerId: containerId,
 						Force:       true,
 						Reason:      types.StopContainerReasonTtl,

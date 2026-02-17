@@ -10,6 +10,7 @@ import (
 	"github.com/beam-cloud/beta9/pkg/clients"
 	"github.com/beam-cloud/beta9/pkg/types"
 	pb "github.com/beam-cloud/beta9/proto"
+	"github.com/rs/zerolog/log"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -26,7 +27,8 @@ func (gws *GatewayService) HeadObject(ctx context.Context, in *pb.HeadObjectRequ
 	if err == nil {
 		exists := true
 
-		objectPath := path.Join(types.DefaultObjectPath, authInfo.Workspace.Name)
+		// Check if the actual object file exists, not just the directory
+		objectPath := path.Join(types.DefaultObjectPath, authInfo.Workspace.Name, existingObject.ExternalId)
 		if _, err := os.Stat(objectPath); os.IsNotExist(err) {
 			exists = false
 		}
@@ -124,10 +126,12 @@ func (gws *GatewayService) CreateObject(ctx context.Context, in *pb.CreateObject
 }
 
 func (gws *GatewayService) PutObjectStream(stream pb.GatewayService_PutObjectStreamServer) error {
+	log.Info().Msg("PutObjectStream: starting")
 	ctx := stream.Context()
 	authInfo, _ := auth.AuthInfoFromContext(ctx)
 
 	if !auth.HasPermission(authInfo) {
+		log.Warn().Msg("PutObjectStream: unauthorized access")
 		return status.Error(codes.PermissionDenied, "Unauthorized Access")
 	}
 
@@ -137,31 +141,40 @@ func (gws *GatewayService) PutObjectStream(stream pb.GatewayService_PutObjectStr
 	var size int
 	var file *os.File
 	var newObject *types.Object
+	var chunkCount int
 
 	for {
 		request, err := stream.Recv()
 		if err == io.EOF {
+			log.Info().Int("chunks", chunkCount).Int("total_size", size).Msg("PutObjectStream: EOF received")
 			break
 		}
 
 		if err != nil {
+			log.Error().Err(err).Msg("PutObjectStream: error receiving stream")
 			return stream.SendAndClose(&pb.PutObjectResponse{
 				Ok:       false,
 				ErrorMsg: "Unable to receive stream of bytes",
 			})
 		}
 
+		chunkCount++
 		if file == nil {
+			log.Info().Str("hash", request.Hash).Msg("PutObjectStream: creating object")
 			newObject, err = gws.backendRepo.CreateObject(ctx, request.Hash, 0, authInfo.Workspace.Id)
 			if err != nil {
+				log.Error().Err(err).Msg("PutObjectStream: error creating object in repo")
 				return stream.SendAndClose(&pb.PutObjectResponse{
 					Ok:       false,
 					ErrorMsg: "Unable to create object",
 				})
 			}
 
-			file, err = os.Create(path.Join(objectPath, newObject.ExternalId))
+			filePath := path.Join(objectPath, newObject.ExternalId)
+			log.Info().Str("path", filePath).Msg("PutObjectStream: creating file")
+			file, err = os.Create(filePath)
 			if err != nil {
+				log.Error().Err(err).Str("path", filePath).Msg("PutObjectStream: error creating file")
 				gws.backendRepo.DeleteObjectByExternalId(ctx, newObject.ExternalId)
 				return stream.SendAndClose(&pb.PutObjectResponse{
 					Ok:       false,
@@ -173,6 +186,7 @@ func (gws *GatewayService) PutObjectStream(stream pb.GatewayService_PutObjectStr
 
 		s, err := file.Write(request.ObjectContent)
 		if err != nil {
+			log.Error().Err(err).Msg("PutObjectStream: error writing to file")
 			os.Remove(path.Join(objectPath, newObject.ExternalId))
 			gws.backendRepo.DeleteObjectByExternalId(ctx, newObject.ExternalId)
 			return stream.SendAndClose(&pb.PutObjectResponse{
@@ -183,7 +197,23 @@ func (gws *GatewayService) PutObjectStream(stream pb.GatewayService_PutObjectStr
 		size += s
 	}
 
+	log.Info().Int("size", size).Msg("PutObjectStream: syncing file")
+	// Sync file to ensure data is flushed to the filesystem (required for JuiceFS)
+	if file != nil {
+		if err := file.Sync(); err != nil {
+			log.Error().Err(err).Msg("PutObjectStream: error syncing file")
+			os.Remove(path.Join(objectPath, newObject.ExternalId))
+			gws.backendRepo.DeleteObjectByExternalId(ctx, newObject.ExternalId)
+			return stream.SendAndClose(&pb.PutObjectResponse{
+				Ok:       false,
+				ErrorMsg: "Unable to sync file content",
+			})
+		}
+	}
+
+	log.Info().Msg("PutObjectStream: updating object size")
 	if err := gws.backendRepo.UpdateObjectSizeByExternalId(ctx, newObject.ExternalId, size); err != nil {
+		log.Error().Err(err).Msg("PutObjectStream: error updating object size")
 		os.Remove(path.Join(objectPath, newObject.ExternalId))
 		gws.backendRepo.DeleteObjectByExternalId(ctx, newObject.ExternalId)
 		return stream.SendAndClose(&pb.PutObjectResponse{
@@ -192,6 +222,7 @@ func (gws *GatewayService) PutObjectStream(stream pb.GatewayService_PutObjectStr
 		})
 	}
 
+	log.Info().Str("object_id", newObject.ExternalId).Int("size", size).Msg("PutObjectStream: completed successfully")
 	return stream.SendAndClose(&pb.PutObjectResponse{
 		Ok:       true,
 		ObjectId: newObject.ExternalId,

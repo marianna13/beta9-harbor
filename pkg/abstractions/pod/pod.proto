@@ -157,6 +157,13 @@ service PodService {
       get : "/pods/{container_id}/urls"
     };
   }
+  rpc SandboxWaitForCompletion(PodSandboxWaitForCompletionRequest)
+      returns (PodSandboxWaitForCompletionResponse) {
+    option (google.api.http) = {
+      post : "/pods/{container_id}/wait"
+      body : "*"
+    };
+  }
 }
 
 message CreatePodRequest {
@@ -418,4 +425,19 @@ message PodSandboxListUrlsResponse {
   bool ok = 1;
   map<int32, string> urls = 2;
   string error_msg = 3;
+}
+
+message PodSandboxWaitForCompletionRequest {
+  string container_id = 1;
+  int32 pid = 2;
+  int32 timeout_seconds = 3;
+}
+
+message PodSandboxWaitForCompletionResponse {
+  bool ok = 1;
+  string error_msg = 2;
+  int32 exit_code = 3;
+  string stdout = 4;
+  string stderr = 5;
+  bool timed_out = 6;
 }

@@ -29,7 +29,7 @@ import (
 
 const (
 	containerLogsPath              string        = "/var/log/worker"
-	defaultWorkerSpindownTimeS     float64       = 300 // 5 minutes
+	defaultWorkerSpindownTimeS     float64       = 1800 // 30 minutes
 	defaultCacheWaitTime           time.Duration = 30 * time.Second
 	containerStatusUpdateInterval  time.Duration = 30 * time.Second
 	containerRequestStreamInterval time.Duration = 100 * time.Millisecond
@@ -93,6 +93,7 @@ type ContainerInstance struct {
 	StopReason                 types.StopContainerReason
 	SandboxProcessManager      *goproc.GoProcClient
 	SandboxProcessManagerReady bool
+	SandboxReadyChan           chan struct{}
 	ContainerIp                string
 	Runtime                    runtime.Runtime
 	OOMWatcher                 runtime.OOMWatcher

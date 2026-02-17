@@ -27,9 +27,10 @@ func (s *GenericPodService) SandboxExec(ctx context.Context, in *pb.PodSandboxEx
 
 	resp, err := client.SandboxExec(in.ContainerId, in.Command, in.Env, in.Cwd)
 	if err != nil {
+		log.Error().Err(err).Str("container_id", in.ContainerId).Msg("SandboxExec failed")
 		return &pb.PodSandboxExecResponse{
 			Ok:       false,
-			ErrorMsg: "Failed to execute command",
+			ErrorMsg: fmt.Sprintf("Failed to execute command: %v", err),
 		}, nil
 	}
 
@@ -712,6 +713,35 @@ func (s *GenericPodService) SandboxListUrls(ctx context.Context, in *pb.PodSandb
 	return &pb.PodSandboxListUrlsResponse{
 		Ok:   true,
 		Urls: urls,
+	}, nil
+}
+
+func (s *GenericPodService) SandboxWaitForCompletion(ctx context.Context, in *pb.PodSandboxWaitForCompletionRequest) (*pb.PodSandboxWaitForCompletionResponse, error) {
+	authInfo, _ := auth.AuthInfoFromContext(ctx)
+
+	client, _, err := s.getClient(ctx, in.ContainerId, authInfo.Token.Key, authInfo.Workspace.ExternalId)
+	if err != nil {
+		return &pb.PodSandboxWaitForCompletionResponse{
+			Ok:       false,
+			ErrorMsg: "Failed to connect to sandbox",
+		}, nil
+	}
+
+	resp, err := client.SandboxWaitForCompletion(in.ContainerId, in.Pid, in.TimeoutSeconds)
+	if err != nil {
+		return &pb.PodSandboxWaitForCompletionResponse{
+			Ok:       false,
+			ErrorMsg: fmt.Sprintf("Failed to wait for completion: %v", err),
+		}, nil
+	}
+
+	return &pb.PodSandboxWaitForCompletionResponse{
+		Ok:       resp.Ok,
+		ErrorMsg: resp.ErrorMsg,
+		ExitCode: resp.ExitCode,
+		Stdout:   resp.Stdout,
+		Stderr:   resp.Stderr,
+		TimedOut: resp.TimedOut,
 	}, nil
 }
 
