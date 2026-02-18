@@ -1,0 +1,3 @@
+[submodule "clip-lib"]
+    path = clip-lib
+	url = https://github.com/marianna13/clip-lib.git
